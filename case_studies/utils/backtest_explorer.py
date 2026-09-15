@@ -48,11 +48,18 @@ _BEST_SCHEMA: dict[str, pl.DataType] = {
     "source": pl.Utf8,
     "family": pl.Utf8,
     "config_name": pl.Utf8,
+    # A configuration publishes a prediction set per checkpoint, and those
+    # checkpoints rank separately, so without these two a ten-row table can print
+    # one configuration six times at six Sharpes with nothing saying what differs.
+    # Measured on us_firm_characteristics: six of the ten best signal-stage rows
+    # for fwd_ret_1m were gbm/leaves_7_mse at top_k 50, iterations 200 to 450.
+    "checkpoint_kind": pl.Utf8,
+    "checkpoint_value": pl.Int64,
     "label": pl.Utf8,
     "signal_method": pl.Utf8,
     # The entry-scheme sweep varies concentration and nothing else, so without
     # this the ten-row top table reads as one strategy repeated at different
-    # Sharpes (ml4t/agent-workspace#910).
+    # Sharpes.
     "top_k": pl.Int64,
     "universe_filter": pl.Utf8,
     "exit_at_max_days": pl.Int64,
@@ -68,12 +75,48 @@ _BEST_SCHEMA: dict[str, pl.DataType] = {
     "ic_n_days": pl.Float64,
 }
 
+
+def _drop_rows_a_reader_cannot_tell_apart(df: pl.DataFrame) -> pl.DataFrame:
+    """Collapse leaderboard rows that are identical in every column but the hash.
+
+    A configuration keeps its results when a spec field is added that it never set:
+    the identity is new, the numbers are not. Measured 2026-09-14 across the nine
+    registries, keying on prediction and on the strategy view a reader sees:
+    ``us_firm_characteristics`` holds 80 of 240 allocation configurations and 912 of
+    2,276 signal configurations twice, ``etfs`` 424 of 1,767 and
+    ``crypto_perps_funding`` 273 of 2,109 - 1,689 pairs in total, every pair agreeing
+    on Sharpe. One pair diffed: the two specs differ in
+    ``account.lock_notional_update_mode`` unset against ``position_legs`` and
+    ``position_sizing.share_rounding`` unset against ``nearest``, both previously
+    implicit defaults that the config schema made explicit. So a schema change
+    re-keyed the identity and moved nothing measurable.
+
+    ``best`` ranks over every generation in the registry, so both rows compete and a
+    ten-row table can show five configurations. This is the same defect
+    ``signal_method`` alone had, one level down: there the
+    displayed columns could not separate rows that genuinely differed, here the rows
+    do not differ at all.
+
+    The rule is the narrowest one that fixes it: drop a row only when every column a
+    caller receives, except ``backtest_hash``, equals one already kept. Such a row
+    carries nothing a reader could have read off it, so no information is lost, and
+    the first row of any group survives under the query's existing
+    ``sharpe DESC, backtest_hash ASC`` ordering - which is why nothing that selects on
+    ``best`` can change its answer, only the repeats below it disappear.
+    """
+    return df.unique(
+        subset=[c for c in df.columns if c != "backtest_hash"],
+        keep="first",
+        maintain_order=True,
+    )
+
+
 # Canonical schema for BacktestExplorer.specs() output. Declared rather than inferred:
 # polars types an empty column as Null, and `.str.json_path_match` on a Null series raises
 # SchemaError instead of returning an empty result. A notebook whose registry holds no rows
 # for the stage it asks about would then fail on the dtype, several cells after the fact,
 # reporting a schema problem for what is actually an empty sweep
-# (ml4t/agent-workspace#1075).
+# .
 _SPEC_SCHEMA: dict[str, pl.DataType] = {
     "backtest_hash": pl.Utf8,
     "stage": pl.Utf8,
@@ -337,8 +380,10 @@ class BacktestExplorer:
         -------
         pl.DataFrame
             Columns: backtest_hash, prediction_hash, source, family,
-            config_name, label, signal_method, top_k, sharpe, cagr,
-            max_drawdown, total_return, volatility, ic_mean
+            config_name, checkpoint_kind, checkpoint_value, label,
+            signal_method, top_k, universe_filter, exit_at_max_days, sharpe,
+            cagr, max_drawdown, total_return, volatility, ic_mean,
+            ic_mean_daily, ic_ci_lo, ic_ci_hi, ic_n_days
         """
         filter_sql = ""
         filter_params: list[str] = []
@@ -368,6 +413,8 @@ class BacktestExplorer:
                 b.stage,
                 t.family,
                 t.config_name,
+                p.checkpoint_kind,
+                p.checkpoint_value,
                 t.label,
                 bm.sharpe,
                 bm.cagr,
@@ -392,14 +439,12 @@ class BacktestExplorer:
               AND (bm.num_trades IS NULL OR bm.num_trades > 0)
               {filter_sql}
             ORDER BY bm.sharpe DESC, b.backtest_hash ASC
-            LIMIT ?
             """,
             (
                 stage,
                 *excluded_family_sql(self.case_study, "t.family")[1],
                 *coverage_params,
                 *filter_params,
-                top_n,
             ),
         )
         if df.is_empty():
@@ -438,7 +483,7 @@ class BacktestExplorer:
         # Every entry scheme in a baseline sweep is `equal_weight_top_k` and varies
         # only `top_k`, so `signal_method` alone made nine of the ten rows read as
         # the same strategy. `top_k` sits one key across from `method` in the spec
-        # this block already parses (ml4t/agent-workspace#910).
+        # this block already parses.
         top_k = [strategy_view(sp).get("signal", {}).get("top_k") for sp in parsed]
         df = df.with_columns(
             pl.Series("signal_method", methods),
@@ -447,28 +492,32 @@ class BacktestExplorer:
             pl.Series("exit_at_max_days", exit_at_max_days, dtype=pl.Int64),
         )
 
-        return df.select(
-            "backtest_hash",
-            "prediction_hash",
-            "source",
-            "family",
-            "config_name",
-            "label",
-            "signal_method",
-            "top_k",
-            "universe_filter",
-            "exit_at_max_days",
-            "sharpe",
-            "cagr",
-            "max_drawdown",
-            "total_return",
-            "volatility",
-            "ic_mean",
-            "ic_mean_daily",
-            "ic_ci_lo",
-            "ic_ci_hi",
-            "ic_n_days",
-        )
+        return _drop_rows_a_reader_cannot_tell_apart(
+            df.select(
+                "backtest_hash",
+                "prediction_hash",
+                "source",
+                "family",
+                "config_name",
+                "checkpoint_kind",
+                "checkpoint_value",
+                "label",
+                "signal_method",
+                "top_k",
+                "universe_filter",
+                "exit_at_max_days",
+                "sharpe",
+                "cagr",
+                "max_drawdown",
+                "total_return",
+                "volatility",
+                "ic_mean",
+                "ic_mean_daily",
+                "ic_ci_lo",
+                "ic_ci_hi",
+                "ic_n_days",
+            )
+        ).head(top_n)
 
     # -----------------------------------------------------------------
     # compare_families: model family comparison at a stage
@@ -661,7 +710,7 @@ class BacktestExplorer:
             return pl.DataFrame()
         placeholders = ", ".join("?" for _ in stages)
         # A run the engine stopped at ruin carries a null Sharpe by design
-        # (ml4t/agent-workspace#920). Dropping those in SQL, as this query used to,
+        # . Dropping those in SQL, as this query used to,
         # would take an allocator that went bankrupt in every run off the table
         # entirely and report the survivors as the whole population. The rows are
         # kept and counted under `ruined`; the Sharpe and drawdown statistics are
@@ -1335,8 +1384,8 @@ class BacktestExplorer:
                     "num_trades": trades,
                     # How many times the control acted. 0 is an overlay that was
                     # installed and never fired; NULL is a run the engine did not
-                    # count, which is every row registered before
-                    # ml4t/agent-workspace#1051. Matching Sharpe and trade counts
+                    # count, which is every row registered before the trigger log
+                    # existed. Matching Sharpe and trade counts
                     # never established either one on their own.
                     "risk_triggers": triggers,
                     "prediction_hash": pred_h,
@@ -1800,7 +1849,7 @@ class BacktestExplorer:
         return result
 
     # -----------------------------------------------------------------
-    # concentration_curve: Sharpe vs top_k at allocation stage
+    # concentration_curve: Sharpe vs top_k at a named stage
     # -----------------------------------------------------------------
 
     def concentration_curve(
@@ -1808,18 +1857,28 @@ class BacktestExplorer:
     ) -> pl.DataFrame:
         """Sharpe vs top_k for a given prediction, at one or more stages.
 
-        Shows how portfolio concentration affects performance — typically
-        more actionable than allocator comparison alone.
+        Shows how portfolio concentration affects performance, which is usually
+        more actionable than comparing allocators alone.
 
         Parameters
         ----------
         stage : str or tuple of str, default ``"allocation"``
-            Which backtest stages to read. The default is unchanged, but the
-            entry-scheme sweep that varies concentration lives at the **signal**
-            stage, and that is where the first three notebooks of the backtesting
-            sequence read. This method used to hardcode the allocation stage, so
-            asking it about a baseline sweep returned an empty frame with no
-            indication that the rows were one stage away (ml4t/agent-workspace#910).
+            Which backtest stages to read. **Name it at the call site.** The
+            default is wrong for most inputs and cannot be made right by picking
+            the other stage: the entry-scheme sweep lives at the **signal**
+            stage for a baseline sweep and at the **allocation** stage once an
+            allocator menu is crossed with it, and those are different
+            populations. Counted 2026-09-14: 585 of etfs' 606 predictions, 953
+            of 1,007 in sp500_equity_option_analytics, 734 of 744 in
+            nasdaq100_microstructure and 539 of 569 in us_firm_characteristics
+            hold signal rows and nothing at the allocation stage.
+
+            The default is kept rather than removed only because removing it
+            edits a rendered notebook that cannot currently be re-run.
+            Every call site in the repository names
+            its stage; the default is now reachable only by a new caller who has
+            not read this.
+            the same defect twice over.
 
         Returns
         -------

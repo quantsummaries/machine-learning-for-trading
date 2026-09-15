@@ -44,6 +44,7 @@ import polars as pl
 import torch  # noqa: F401
 
 from case_studies.utils.analytics import PRIMARY_LABELS, SHORT_NAMES
+from case_studies.utils.booster_paths import booster_dir
 from case_studies.utils.conformal import (
     sizing_conformal_lag,
     walk_forward_conformal_coverage,
@@ -563,19 +564,12 @@ def load_gbm_feature_importance(
     import lightgbm as lgb
 
     case_dir = get_case_study_dir(case_study)
-    # The training stage writes boosters under the run's own models directory. The two
-    # older layouts are kept because run logs predating that move still carry them.
-    candidates = [
-        case_dir / "run_log" / "training" / training_hash / "models" / "boosters",
-        case_dir / "run_log" / "training" / training_hash / "boosters",
-        case_dir / "run_log" / "models" / training_hash / "boosters",
-    ]
-    booster_dir = next((path for path in candidates if path.exists()), None)
-    if booster_dir is None:
+    run_booster_dir = booster_dir(case_dir, training_hash)
+    if run_booster_dir is None:
         return pl.DataFrame()
 
     rows = []
-    for booster_file in sorted(booster_dir.glob("*.txt")):
+    for booster_file in sorted(run_booster_dir.glob("*.txt")):
         fold_text = booster_file.stem.split("fold")[-1].lstrip("_")
         with contextlib.suppress(ValueError):
             fold_id = int(fold_text)
@@ -651,7 +645,7 @@ def plot_cross_cs_forest(
     n = len(d)
     if figsize is None:
         figsize = (7.5, max(2.5, 0.45 * n + 1.2))
-    fig, ax = plt.subplots(figsize=figsize)
+    fig, ax = plt.subplots(figsize=figsize, layout="tight")
     y = np.arange(n)
     ic = d["ic_mean_daily"].to_numpy()
     lo = d["ic_ci_lo"].to_numpy()
@@ -728,7 +722,7 @@ def plot_per_fold_violin(
 
     if figsize is None:
         figsize = (max(6.5, 1.0 * len(present) + 2), 4.5)
-    fig, ax = plt.subplots(figsize=figsize)
+    fig, ax = plt.subplots(figsize=figsize, layout="tight")
     data = [fold_df.filter(pl.col("short_name") == cs)["ic"].to_numpy() for cs in present]
     positions = np.arange(len(present))
     ax.boxplot(data, positions=positions, widths=0.55, showfliers=True)
@@ -841,7 +835,7 @@ def plot_rolling_daily_ic(
         if not roll.is_empty():
             series[cs] = roll
 
-    fig, ax = plt.subplots(figsize=figsize)
+    fig, ax = plt.subplots(figsize=figsize, layout="tight")
     if not series:
         ax.text(0.5, 0.5, "No daily-IC series available", ha="center", va="center")
         ax.set_axis_off()
@@ -922,7 +916,7 @@ def plot_multi_label_horizon(
         ax.set_axis_off()
         return fig, ax
 
-    fig, ax = plt.subplots(figsize=figsize)
+    fig, ax = plt.subplots(figsize=figsize, layout="tight")
     if palette is None:
         from utils.style import COLORS
 

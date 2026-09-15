@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import sqlite3
 import warnings
-from pathlib import Path
 from typing import Any
 
 # Import lightgbm before ml4t.diagnostic, which transitively loads
@@ -44,6 +43,7 @@ from ml4t.diagnostic.metrics import cross_sectional_ic
 
 from utils.paths import get_case_study_dir
 
+from .booster_paths import booster_dir
 from .notebook_contracts import defined_ic, degenerate_prediction_sql
 
 # ---------------------------------------------------------------------------
@@ -912,8 +912,8 @@ def load_gbm_feature_importance(
 ) -> pl.DataFrame | None:
     """Load GBM feature importance from saved booster files.
 
-    Looks for LightGBM booster .txt files in run_log/training/{hash}/boosters/.
-    Extracts gain-based importance per fold.
+    The training stage writes boosters under the run's own models directory,
+    run_log/training/{hash}/models/boosters/. Extracts gain-based importance per fold.
 
     Returns DataFrame with columns: config_name, fold_id, feature, importance.
     Returns None if no booster files found.
@@ -943,14 +943,11 @@ def load_gbm_feature_importance(
 
     results = []
     for t_hash, config_name in rows:
-        booster_dir = case_dir / "run_log" / "training" / t_hash / "boosters"
-        if not booster_dir.exists():
-            # Also check under run_log/models/{hash}/boosters (older layout)
-            booster_dir = case_dir / "run_log" / "models" / t_hash / "boosters"
-        if not booster_dir.exists():
+        run_booster_dir = booster_dir(case_dir, t_hash)
+        if run_booster_dir is None:
             continue
 
-        for booster_file in sorted(booster_dir.glob("*.txt")):
+        for booster_file in sorted(run_booster_dir.glob("*.txt")):
             # Extract fold from filename: fold_0.txt or {config}_fold0.txt
             name = booster_file.stem
             fold_str = name.split("fold")[-1].lstrip("_") if "fold" in name else "0"
