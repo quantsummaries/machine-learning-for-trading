@@ -81,6 +81,7 @@ from case_studies.utils.sweep_config import (
     get_checkpoints_per_config,
     get_top_k_values_for,
     get_top_n_predictions,
+    top_n_cap,
 )
 from utils.paths import get_case_study_dir
 from utils.style import COLORS, FIGSIZE, add_message_title, show_with_alt
@@ -93,6 +94,7 @@ LABEL = ""
 MAX_SYMBOLS = 0
 SKIP_EXPENSIVE_ALLOC = False
 TOP_N_PREDICTIONS = None
+SUPERSEDES_ALLOCATION_POPULATIONS: dict[str, str] | None = None
 
 # %% [markdown]
 # ### What is asked for, and what it resolves to
@@ -132,6 +134,7 @@ TOP_N = (
     if TOP_N_PREDICTIONS is not None
     else get_top_n_predictions(CASE_STUDY_ID, "allocation")
 )
+TOP_N_CAP = top_n_cap(TOP_N)
 CHECKPOINTS_PER_CONFIG = get_checkpoints_per_config(CASE_STUDY_ID)
 ALLOCATION_LABEL = LABEL or bt_config.primary_label
 
@@ -201,8 +204,16 @@ top_preds = resolve_best_predictions(
     prediction_hashes=CURRENT_MEMBERS,
     backtest_hashes=BASELINE_GRID,
 )
-if len(top_preds) != TOP_N:
-    raise RuntimeError(f"Expected {TOP_N} advancing configurations, found {len(top_preds)}")
+# The unit here is a configuration, not a row: `resolve_best_predictions` returns
+# `checkpoints_per_config` rows per advancing config, so `len(top_preds)` counts configurations
+# only while that is 1. A width of 0 asks for every configuration, as `top_n_predictions.signal`
+# does in this setup.yaml, and then there is no count to promise - only that something advanced.
+advancing_configs = top_preds.select("family", "config_name").n_unique()
+if TOP_N_CAP is None:
+    if not advancing_configs:
+        raise RuntimeError("No configuration advanced to the allocation stage")
+elif advancing_configs != TOP_N_CAP:
+    raise RuntimeError(f"Expected {TOP_N} advancing configurations, found {advancing_configs}")
 
 selected_hashes = top_preds["prediction_hash"].to_list()
 top_preds.select("source", "prediction_hash", "sharpe")
@@ -358,7 +369,21 @@ ALLOCATION_POPULATION = sweep_plan_name(
 # change that name's membership without saying so, and the refusal it pre-empts is the one
 # thing that makes a changed grid visible. Add an entry when a run is actually refused, with
 # the hash the refusal prints.
-SUPERSEDES_ALLOCATION_POPULATIONS: dict[str, str] = {}
+_DECLARED_SUPERSEDES_ALLOCATION_POPULATIONS: dict[str, str] = {}
+
+# Resolved under a different name, per the convention stated at the parameters cell: an
+# injected parameter wins, otherwise the case study's own declaration does. Until 2026-09-18
+# the committed map above *was* the parameter name, and because it is assigned here rather
+# than in the parameters cell it overwrote whatever papermill injected, before the
+# `population_supersedes` call below ever read it. A run that declared the supersedes it was
+# asked for was refused as though it had declared nothing. The two sibling notebooks guarded by the same freeze already take this
+# as a parameter: cme_futures as SUPERSEDES_ALLOCATION_POPULATION, crypto_perps_funding as
+# SUPERSEDES_ALLOCATION.
+_supersedes_allocation_populations = (
+    _DECLARED_SUPERSEDES_ALLOCATION_POPULATIONS
+    if SUPERSEDES_ALLOCATION_POPULATIONS is None
+    else SUPERSEDES_ALLOCATION_POPULATIONS
+)
 
 _plan = None
 try:
@@ -398,7 +423,7 @@ else:
             supersedes=population_supersedes(
                 _writable,
                 name=ALLOCATION_POPULATION,
-                declared=SUPERSEDES_ALLOCATION_POPULATIONS.get(ALLOCATION_POPULATION),
+                declared=_supersedes_allocation_populations.get(ALLOCATION_POPULATION),
             ),
         )
         # Before any member executes; see `sweep_attestation_name`.
